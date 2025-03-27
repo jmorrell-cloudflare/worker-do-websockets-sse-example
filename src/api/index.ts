@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 
 export interface Env {
-  DO_OBJECT: DurableObjectNamespace;
+  DO_OBJECT: DurableObjectNamespace<WebSocketDO>;
   ASSETS: Fetcher;
 }
 
@@ -18,88 +18,93 @@ export class WebSocketDO extends DurableObject<Env> {
     this.storage = ctx.storage;
   }
 
-  async fetch(
-    request: Request,
-    env: Env,
-    ctx: ExecutionContext
-  ): Promise<Response> {
+  async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     console.log("DO received request:", url.pathname);
-    
-    // Handle WebSocket connections
-    if (url.pathname.startsWith("/websocket")) {
-      // Extract session ID from the URL
-      const sessionId = url.searchParams.get("sessionId");
-      if (!sessionId) {
-        return new Response("Missing sessionId", { status: 400 });
-      }
 
-      console.log("WebSocket connection for session:", sessionId);
+    // Handle WebSocket connections for any path
+    // Extract session ID from the URL
+    const sessionId = url.searchParams.get("sessionId");
+    if (!sessionId) {
+      return new Response("Missing sessionId", { status: 400 });
+    }
 
-      // Create a new WebSocket pair
-      const webSocketPair = new WebSocketPair();
-      const [client, server] = Object.values(webSocketPair);
+    console.log("WebSocket connection for session:", sessionId);
 
-      // Accept the WebSocket with hibernation support
-      this.ctx.acceptWebSocket(server);
+    // Create a new WebSocket pair
+    const webSocketPair = new WebSocketPair();
+    const [client, server] = Object.values(webSocketPair);
 
-      // Store the connection for later use
-      this.webSocketConnections.set(sessionId, server);
-      
-      // Store the session ID in storage to survive hibernation
-      await this.storage.put(`session:${sessionId}`, true);
+    // Accept the WebSocket with hibernation support
+    this.ctx.acceptWebSocket(server);
 
-      // Send initial connection message
-      server.send(JSON.stringify({ type: "connected", sessionId }));
+    // Store the connection for later use
+    this.webSocketConnections.set(sessionId, server);
 
-      return new Response(null, {
-        status: 101,
-        webSocket: client,
+    // Store the session ID in storage to survive hibernation
+    await this.storage.put(`session:${sessionId}`, true);
+
+    // Send initial connection message
+    server.send(JSON.stringify({ type: "connected", sessionId }));
+
+    return new Response(null, {
+      status: 101,
+      webSocket: client,
+    });
+  }
+
+  // RPC endpoint for sending messages
+  async postMessage(data: {
+    sessionId: string;
+    message: string;
+  }): Promise<Response> {
+    const { sessionId, message } = data;
+
+    console.log(
+      "RPC postMessage for session:",
+      sessionId,
+      "with message:",
+      message
+    );
+
+    if (!sessionId) {
+      return new Response("Missing sessionId", { status: 400 });
+    }
+
+    // Check if we have this session in storage
+    const sessionExists = await this.storage.get(`session:${sessionId}`);
+    if (!sessionExists) {
+      console.error(`Session ${sessionId} not found in storage`);
+      return new Response("Session not found", { status: 404 });
+    }
+
+    const webSocket = this.webSocketConnections.get(sessionId);
+    if (!webSocket) {
+      console.error(
+        `WebSocket for session ${sessionId} not found in memory, but exists in storage`
+      );
+      // This can happen if the DO was hibernated and restored
+      return new Response("WebSocket connection lost, please reconnect", {
+        status: 410,
       });
     }
-    
-    // Handle message relaying
-    if (url.pathname.startsWith("/relay") && request.method === "POST") {
-      const data = await request.json();
-      const { sessionId, message } = data;
-      
-      console.log("Relay request for session:", sessionId, "with message:", message);
-      
-      if (!sessionId) {
-        return new Response("Missing sessionId", { status: 400 });
-      }
-      
-      // Check if we have this session in storage
-      const sessionExists = await this.storage.get(`session:${sessionId}`);
-      if (!sessionExists) {
-        console.error(`Session ${sessionId} not found in storage`);
-        return new Response("Session not found", { status: 404 });
-      }
-      
-      const webSocket = this.webSocketConnections.get(sessionId);
-      if (!webSocket) {
-        console.error(`WebSocket for session ${sessionId} not found in memory, but exists in storage`);
-        // This can happen if the DO was hibernated and restored
-        return new Response("WebSocket connection lost, please reconnect", { status: 410 });
-      }
 
-      try {
-        // Echo the message back through the WebSocket
-        webSocket.send(JSON.stringify({ 
-          type: "message", 
-          content: message 
-        }));
-        
-        return new Response("Message relayed", { status: 200 });
-      } catch (error) {
-        console.error(`Error sending message to WebSocket: ${error}`);
-        // Clean up the failed connection
-        this.webSocketConnections.delete(sessionId);
-        return new Response(`Error relaying message: ${error}`, { status: 500 });
-      }
+    try {
+      // Echo the message back through the WebSocket
+      webSocket.send(
+        JSON.stringify({
+          type: "message",
+          content: message,
+        })
+      );
+
+      return new Response("Message relayed", { status: 200 });
+    } catch (error) {
+      console.error(`Error sending message to WebSocket: ${error}`);
+      // Clean up the failed connection
+      this.webSocketConnections.delete(sessionId);
+      return new Response(`Error relaying message: ${error}`, { status: 500 });
     }
-
-    return new Response("Not found", { status: 404 });
   }
 
   // WebSocket event handlers for hibernation support
@@ -107,27 +112,39 @@ export class WebSocketDO extends DurableObject<Env> {
     try {
       // Parse the incoming message
       const data = JSON.parse(message);
-      
+
       // Echo back the message
-      ws.send(JSON.stringify({
-        type: "message",
-        content: data.message || "Echo: " + message
-      }));
-    } catch (error) {
-      ws.send(JSON.stringify({
-        type: "error",
-        content: "Failed to process message"
-      }));
+      ws.send(
+        JSON.stringify({
+          type: "message",
+          content: data.message || "Echo: " + message,
+        })
+      );
+    } catch {
+      // If parsing fails, send error message
+      ws.send(
+        JSON.stringify({
+          type: "error",
+          content: "Failed to process message",
+        })
+      );
     }
   }
 
-  async webSocketClose(ws: WebSocket, code: number, reason: string, wasClean: boolean) {
+  async webSocketClose(
+    ws: WebSocket,
+    code: number,
+    reason: string,
+    wasClean: boolean
+  ) {
     // Find and remove the closed connection
     for (const [sessionId, storedWs] of this.webSocketConnections.entries()) {
       if (storedWs === ws) {
-        console.log(`WebSocket closed for session ${sessionId}: code=${code}, reason=${reason}, wasClean=${wasClean}`);
+        console.log(
+          `WebSocket closed for session ${sessionId}: code=${code}, reason=${reason}, wasClean=${wasClean}`
+        );
         this.webSocketConnections.delete(sessionId);
-        
+
         // Remove from persistent storage too
         await this.storage.delete(`session:${sessionId}`);
         break;
@@ -135,9 +152,9 @@ export class WebSocketDO extends DurableObject<Env> {
     }
   }
 
-  async webSocketError(ws: WebSocket, error: any) {
+  async webSocketError(ws: WebSocket, error: unknown) {
     console.error("WebSocket error:", error);
-    
+
     // Clean up on error too
     for (const [sessionId, storedWs] of this.webSocketConnections.entries()) {
       if (storedWs === ws) {
@@ -157,20 +174,12 @@ export default {
     ctx: ExecutionContext
   ): Promise<Response> {
     const url = new URL(request.url);
+    const durableObjectId = "12345";
 
     // Handle SSE connections
     if (url.pathname.startsWith("/sse")) {
       // Generate a unique session ID
       const sessionId = crypto.randomUUID();
-      
-      // Set up SSE response
-      const sseInit = {
-        headers: {
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache",
-          "Connection": "keep-alive",
-        },
-      };
 
       // Create a Transform Stream for SSE
       const { readable, writable } = new TransformStream();
@@ -182,24 +191,27 @@ export default {
       writer.write(encoder.encode(`data: ${initialData}\n\n`));
 
       // Open a WebSocket connection to the Durable Object
-      const id = env.DO_OBJECT.idFromName(sessionId);
+      const id = env.DO_OBJECT.idFromName(durableObjectId);
       const doStub = env.DO_OBJECT.get(id);
-      
+
       // Create WebSocket connection to the Durable Object
+      // Pass sessionId as query param but use any path with WebSocket upgrade header
       const doUrl = new URL(request.url);
-      doUrl.pathname = "/websocket";
       doUrl.searchParams.set("sessionId", sessionId);
-      
+
       // Connect to the Durable Object via WebSocket
       const response = await doStub.fetch(doUrl.toString(), {
         headers: {
-          "Upgrade": "websocket",
+          Upgrade: "websocket",
         },
       });
 
       const ws = response.webSocket;
       if (!ws) {
-        return new Response("Failed to establish WebSocket connection", { status: 500 });
+        return new Response(
+          "Failed to establish WebSocket connection to the Durable Object",
+          { status: 500 }
+        );
       }
 
       // Accept the WebSocket connection
@@ -226,12 +238,20 @@ export default {
       });
 
       // Handle worker unload by closing the connection
-      ctx.waitUntil((async () => {
-        // Keep the worker alive for the duration of the SSE connection
-      })());
+      ctx.waitUntil(
+        (async () => {
+          // Keep the worker alive for the duration of the SSE connection
+        })()
+      );
 
-      return new Response(readable, sseInit);
-    } 
+      return new Response(readable, {
+        headers: {
+          "Content-Type": "text/event-stream",
+          "Cache-Control": "no-cache",
+          Connection: "keep-alive",
+        },
+      });
+    }
     // Handle message route
     else if (url.pathname.startsWith("/message") && request.method === "POST") {
       // Get session ID from headers
@@ -252,42 +272,43 @@ export default {
         }
 
         // Get a stub for the Durable Object
-        const id = env.DO_OBJECT.idFromName(sessionId);
+        const id = env.DO_OBJECT.idFromName(durableObjectId);
         const doStub = env.DO_OBJECT.get(id);
 
-        // Forward the message to the Durable Object
-        // Create a proper URL for the relay endpoint
-        const relayUrl = new URL(request.url);
-        relayUrl.pathname = "/relay";
-        
-        console.log("Forwarding message to DO at:", relayUrl.toString());
-        
-        const doResponse = await doStub.fetch(relayUrl.toString(), {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-          },
-          body: JSON.stringify({ sessionId, message }),
+        // Call the RPC endpoint on the Durable Object
+        console.log("Calling RPC postMessage method for session:", sessionId);
+
+        const doResponse = await doStub.postMessage({
+          sessionId,
+          message,
         });
 
         if (!doResponse.ok) {
           const errorText = await doResponse.text();
-          console.error(`DO returned error: ${doResponse.status} - ${errorText}`);
-          
+          console.error(
+            `DO returned error: ${doResponse.status} - ${errorText}`
+          );
+
           if (doResponse.status === 410) {
             // Connection lost, client should reconnect
-            return new Response("Connection lost, please reconnect", { status: 410 });
+            return new Response("Connection lost, please reconnect", {
+              status: 410,
+            });
           }
-          
-          return new Response(`Failed to relay message: ${errorText}`, { status: 500 });
+
+          return new Response(`Failed to relay message: ${errorText}`, {
+            status: 500,
+          });
         }
 
         return new Response("Message sent", { status: 200 });
       } catch (error) {
         console.error("Error processing message:", error);
-        return new Response(`Error processing message: ${error}`, { status: 500 });
+        return new Response(`Error processing message: ${error}`, {
+          status: 500,
+        });
       }
-    } 
+    }
     // Serve static assets for everything else
     else {
       return env.ASSETS.fetch(request);
